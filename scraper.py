@@ -16,6 +16,7 @@ Bucket destino: gs://komv1/
 
 import hashlib
 import html as html_lib
+import json
 import logging
 import os
 import re
@@ -54,10 +55,10 @@ HEADERS = {
 # ── Modelo ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Sesion:
-    url_video: str       # URL directa al mp4 (janux) o rtmp (camara)
+    url_video: str
     titulo: str
-    fuente: str          # "senado" | "camara"
-    fecha_str: str = ""  # "2026-04-14"
+    fuente: str
+    fecha_str: str = ""
     id: str = ""
 
     def __post_init__(self):
@@ -96,7 +97,6 @@ def get_html(url: str) -> str:
 
 
 def parsear_fecha(texto: str) -> str:
-    """dd/mm/yyyy o 'dd de mes de yyyy' → 'yyyy-mm-dd'"""
     meses = {
         "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
         "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
@@ -115,32 +115,24 @@ def parsear_fecha(texto: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # SCRAPER SENADO
 # ══════════════════════════════════════════════════════════════════════════════
-BASE_SENADO  = "https://tv.senado.cl"
-URL_LISTA    = "https://tv.senado.cl/tvsenado/site/tax/port/all/taxport_7___{n}.html"
-RE_JANUX     = re.compile(r'https?://janux-\d+\.senado\.cl/compactos/[\d/_]+\.mp4', re.I)
+BASE_SENADO = "https://tv.senado.cl"
+URL_LISTA   = "https://tv.senado.cl/tvsenado/site/tax/port/all/taxport_7___{n}.html"
+RE_JANUX    = re.compile(r'https?://janux-\d+\.senado\.cl/compactos/[\d/_]+\.mp4', re.I)
 
 
 def _extraer_mp4_senado(url_sesion: str) -> str | None:
-    """
-    Entra a la página individual de una sesión del Senado
-    y extrae la URL directa al .mp4 de janux-N.senado.cl
-    Busca en: href de <a class="downloadVideo">, atributos data-, y texto del HTML.
-    """
     try:
         html = get_html(url_sesion)
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1. Link con clase downloadVideo (botón "Descargar Video | X MB")
         for a in soup.select("a.downloadVideo, a[class*='download']"):
             href = a.get("href", "")
             if RE_JANUX.search(href):
                 return href
 
-        # 2. Cualquier <a> cuyo href apunte a janux
         for a in soup.find_all("a", href=RE_JANUX):
             return a.get("href")
 
-        # 3. Buscar el patrón en el HTML completo (puede estar en JS o data-)
         m = RE_JANUX.search(html)
         if m:
             return m.group(0)
@@ -152,11 +144,6 @@ def _extraer_mp4_senado(url_sesion: str) -> str | None:
 
 
 def scrape_senado(max_paginas: int = 5) -> list[Sesion]:
-    """
-    Recorre las páginas de listado del Senado.
-    Selector real: article con clases 'col span_1_of_4 article'
-    El link a la sesión está en: div.text > a[href] > h2.title
-    """
     todas = []
 
     for n in range(1, max_paginas + 1):
@@ -165,7 +152,6 @@ def scrape_senado(max_paginas: int = 5) -> list[Sesion]:
             html = get_html(url_pagina)
             soup = BeautifulSoup(html, "html.parser")
 
-            # Selector real: article con esas tres clases
             articulos = soup.find_all(
                 "article",
                 class_=lambda c: c and "span_1_of_4" in c and "article" in c
@@ -178,7 +164,6 @@ def scrape_senado(max_paginas: int = 5) -> list[Sesion]:
             log.info(f"Senado página {n}: {len(articulos)} artículos encontrados")
 
             for art in articulos:
-                # El link envuelve el h2
                 a_tag = art.select_one("div.text a[href]")
                 if not a_tag:
                     continue
@@ -186,21 +171,18 @@ def scrape_senado(max_paginas: int = 5) -> list[Sesion]:
                 href   = a_tag.get("href", "")
                 titulo = a_tag.get_text(strip=True)
 
-                # Fallback: buscar h2 dentro del link
                 h2 = a_tag.find("h2")
                 if h2:
                     titulo = h2.get_text(strip=True)
 
                 url_sesion = urljoin(BASE_SENADO, href)
 
-                # Fecha desde span.date
                 fecha_tag = art.select_one("span.date")
                 fecha = parsear_fecha(fecha_tag.get_text(strip=True)) if fecha_tag else ""
 
                 if not titulo or not url_sesion:
                     continue
 
-                # Entrar a la página individual para obtener el .mp4
                 url_mp4 = _extraer_mp4_senado(url_sesion)
                 if not url_mp4:
                     log.warning(f"Sin MP4 en: {url_sesion}")
@@ -225,28 +207,18 @@ def scrape_senado(max_paginas: int = 5) -> list[Sesion]:
 # SCRAPER CÁMARA
 # ══════════════════════════════════════════════════════════════════════════════
 URL_CAMARA = "https://camara.cl/prensa/television.aspx"
-
-# El onclick está escapado como HTML entities: &#39; en vez de '
-# Después de unescape queda: reproducirVideoLocal('rtmp://...', $(this), 'Título')
-RE_CAMARA = re.compile(
+RE_CAMARA  = re.compile(
     r"reproducirVideoLocal\(\s*'(rtmp://[^']+)'\s*,.*?'([^']+)'\s*\)",
     re.S
 )
 
 
 def scrape_camara() -> list[Sesion]:
-    """
-    Lee camara.cl/prensa/television.aspx.
-    Los onclick están HTML-escapados (&#39;), hay que hacer unescape primero.
-    """
     sesiones = []
     try:
-        html_crudo = get_html(URL_CAMARA)
-
-        # Desescapar HTML entities ANTES de parsear con BeautifulSoup
-        # (BeautifulSoup a veces no expone el onclick escapado correctamente)
+        html_crudo  = get_html(URL_CAMARA)
         html_limpio = html_lib.unescape(html_crudo)
-        soup = BeautifulSoup(html_limpio, "html.parser")
+        soup        = BeautifulSoup(html_limpio, "html.parser")
 
         for tag in soup.find_all(onclick=True):
             onclick = tag.get("onclick", "")
@@ -257,20 +229,17 @@ def scrape_camara() -> list[Sesion]:
             url_rtmp = m.group(1).strip()
             titulo   = m.group(2).strip()
 
-            # Buscar fecha en el contenedor padre
             fecha_txt = ""
             for padre in [tag.find_parent("article"),
                           tag.find_parent("div"),
                           tag.find_parent("li")]:
                 if padre:
-                    # Fecha en span con color azul corporativo
                     span = padre.find("span", style=lambda v: v and (
                         "#0066cc" in v or "#006" in v or "color" in v
                     ))
                     if span:
                         fecha_txt = span.get_text(strip=True)
                         break
-                    # Alternativa: cualquier texto con formato dd/mm/yyyy
                     m_fecha = re.search(r"\d{1,2}/\d{1,2}/\d{4}", padre.get_text())
                     if m_fecha:
                         fecha_txt = m_fecha.group(0)
@@ -288,7 +257,6 @@ def scrape_camara() -> list[Sesion]:
     except Exception as e:
         log.error(f"Error scrapeando Cámara: {e}")
 
-    # Eliminar duplicados por URL
     vistos, unicos = set(), []
     for s in sesiones:
         if s.url_video not in vistos:
@@ -300,127 +268,8 @@ def scrape_camara() -> list[Sesion]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DESCARGA → MP3
+# PUB/SUB — NOTIFICACIONES
 # ══════════════════════════════════════════════════════════════════════════════
-def _tiene_rtmpdump() -> bool:
-    try:
-        subprocess.run(["rtmpdump", "--help"],
-                       capture_output=True, timeout=5)
-        return True
-    except FileNotFoundError:
-        return False
-
-
-def _descargar_rtmp_a_mp3(url_rtmp: str, ruta_mp3: str) -> bool:
-    """
-    Descarga un stream rtmp con rtmpdump y lo convierte a MP3 con ffmpeg
-    en un solo pipeline, sin guardar el video completo en disco.
-
-    rtmpdump -r URL -o - | ffmpeg -i pipe:0 -vn -ab 128k -f mp3 salida.mp3
-    """
-    log.info(f"Descargando RTMP → MP3: {url_rtmp[:70]}")
-
-    rtmpdump_cmd = [
-        "rtmpdump",
-        "-r", url_rtmp,
-        "-o", "-",           # output a stdout
-        "--quiet",
-    ]
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-i", "pipe:0",      # input desde stdin
-        "-vn",               # ignorar video
-        "-acodec", "libmp3lame",
-        "-ab", MP3_BITRATE,
-        "-f", "mp3",
-        "-y",                # sobreescribir si existe
-        ruta_mp3,
-    ]
-
-    try:
-        # Pipe directo entre rtmpdump y ffmpeg
-        proc_rtmp  = subprocess.Popen(rtmpdump_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        proc_ffmpeg = subprocess.Popen(ffmpeg_cmd,  stdin=proc_rtmp.stdout,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        proc_rtmp.stdout.close()
-        proc_ffmpeg.wait(timeout=3600)
-        proc_rtmp.wait(timeout=10)
-
-        if proc_ffmpeg.returncode == 0 and os.path.exists(ruta_mp3):
-            tam_mb = os.path.getsize(ruta_mp3) / 1_048_576
-            log.info(f"MP3 listo: {ruta_mp3} ({tam_mb:.1f} MB)")
-            return True
-        else:
-            log.error(f"ffmpeg terminó con código {proc_ffmpeg.returncode}")
-            return False
-
-    except subprocess.TimeoutExpired:
-        log.error("Timeout en descarga RTMP")
-        return False
-    except Exception as e:
-        log.error(f"Error en pipeline rtmp→mp3: {e}")
-        return False
-
-
-def descargar_mp3(sesion: Sesion, tmp: str = "/tmp") -> str | None:
-    """
-    Senado  → yt-dlp (URL mp4 directa de janux, funciona perfecto)
-    Cámara  → rtmpdump + ffmpeg en pipeline (URL rtmp)
-    """
-    nombre   = f"{sesion.fuente}_{sesion.id}"
-    ruta_mp3 = f"{tmp}/{nombre}.mp3"
-
-    if sesion.fuente == "senado":
-        # ── Senado: descarga directa con yt-dlp ──────────────────────────────
-        plantilla = f"{tmp}/{nombre}.%(ext)s"
-        cmd = [
-            "yt-dlp",
-            "--extract-audio",
-            "--audio-format",  "mp3",
-            "--audio-quality", MP3_BITRATE,
-            "--output",        plantilla,
-            "--no-playlist",
-            "--quiet",
-            "--no-warnings",
-            sesion.url_video,
-        ]
-        log.info(f"Descargando (yt-dlp): {sesion.url_video[:80]}")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-
-        if res.returncode == 0 and os.path.exists(ruta_mp3):
-            tam_mb = os.path.getsize(ruta_mp3) / 1_048_576
-            log.info(f"MP3 listo: {ruta_mp3} ({tam_mb:.1f} MB)")
-            return ruta_mp3
-
-        log.error(f"yt-dlp falló: {res.stderr[:300]}")
-        return None
-
-    else:
-        # ── Cámara: rtmpdump + ffmpeg ─────────────────────────────────────────
-        if not _tiene_rtmpdump():
-            log.error(
-                "rtmpdump no está instalado. "
-                "Ejecuta: sudo apt-get install -y rtmpdump"
-            )
-            return None
-
-        ok = _descargar_rtmp_a_mp3(sesion.url_video, ruta_mp3)
-        return ruta_mp3 if ok else None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FIRESTORE
-# ══════════════════════════════════════════════════════════════════════════════
-def ya_procesada(db: firestore.Client, sesion: Sesion) -> bool:
-    doc = db.collection(FIRESTORE_COLECCION).document(sesion.id).get()
-    if not doc.exists:
-        return False
-    # Si falló antes, reintentamos
-    estado = doc.to_dict().get("estado", "")
-    return estado not in ("error_descarga", "error_subida_audio",
-                          "error_transcripcion", "error_guardado_txt")
-
-
 def _notificar(sesion: Sesion, estado: str):
     """Publica en Pub/Sub cuando hay eventos importantes."""
     topic = None
@@ -433,9 +282,8 @@ def _notificar(sesion: Sesion, estado: str):
         return
 
     try:
-        import json
         publisher = pubsub_v1.PublisherClient()
-        mensaje = {
+        mensaje   = {
             "titulo":  sesion.titulo,
             "fuente":  sesion.fuente.upper(),
             "fecha":   sesion.fecha_str,
@@ -447,7 +295,19 @@ def _notificar(sesion: Sesion, estado: str):
         msg_id = futuro.result(timeout=10)
         log.info(f"[Pub/Sub] Publicado en {topic.split('/')[-1]} — id: {msg_id}")
     except Exception as e:
-        log.error(f"[Pub/Sub] ERROR: {e}")
+        log.error(f"[Pub/Sub] ERROR publicando: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIRESTORE
+# ══════════════════════════════════════════════════════════════════════════════
+def ya_procesada(db: firestore.Client, sesion: Sesion) -> bool:
+    doc = db.collection(FIRESTORE_COLECCION).document(sesion.id).get()
+    if not doc.exists:
+        return False
+    estado = doc.to_dict().get("estado", "")
+    return estado not in ("error_descarga", "error_subida_audio",
+                          "error_transcripcion", "error_guardado_txt")
 
 
 def actualizar_estado(db: firestore.Client, sesion: Sesion,
@@ -467,11 +327,9 @@ def actualizar_estado(db: firestore.Client, sesion: Sesion,
     db.collection(FIRESTORE_COLECCION).document(sesion.id).set(datos, merge=True)
     log.info(f"[Firestore] {sesion.id} → {estado}  ({sesion.titulo[:50]})")
 
-    # Notificar en estados importantes
+    # Notificar por Pub/Sub en estados clave
     _notificar(sesion, estado)
-git add scraper.py
-git commit -m "Agregar llamada a _notificar en actualizar_estado"
-git push origin main
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLOUD STORAGE
@@ -516,12 +374,93 @@ def subir_txt(texto: str, sesion: Sesion) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DESCARGA → MP3
+# ══════════════════════════════════════════════════════════════════════════════
+def _tiene_rtmpdump() -> bool:
+    try:
+        subprocess.run(["rtmpdump", "--help"], capture_output=True, timeout=5)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _descargar_rtmp_a_mp3(url_rtmp: str, ruta_mp3: str) -> bool:
+    log.info(f"Descargando RTMP → MP3: {url_rtmp[:70]}")
+
+    rtmpdump_cmd = ["rtmpdump", "-r", url_rtmp, "-o", "-", "--quiet"]
+    ffmpeg_cmd   = [
+        "ffmpeg", "-i", "pipe:0", "-vn",
+        "-acodec", "libmp3lame", "-ab", MP3_BITRATE,
+        "-f", "mp3", "-y", ruta_mp3,
+    ]
+
+    try:
+        proc_rtmp   = subprocess.Popen(rtmpdump_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc_ffmpeg = subprocess.Popen(ffmpeg_cmd, stdin=proc_rtmp.stdout,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc_rtmp.stdout.close()
+        proc_ffmpeg.wait(timeout=3600)
+        proc_rtmp.wait(timeout=10)
+
+        if proc_ffmpeg.returncode == 0 and os.path.exists(ruta_mp3):
+            tam_mb = os.path.getsize(ruta_mp3) / 1_048_576
+            log.info(f"MP3 listo: {ruta_mp3} ({tam_mb:.1f} MB)")
+            return True
+        else:
+            log.error(f"ffmpeg terminó con código {proc_ffmpeg.returncode}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        log.error("Timeout en descarga RTMP")
+        return False
+    except Exception as e:
+        log.error(f"Error en pipeline rtmp→mp3: {e}")
+        return False
+
+
+def descargar_mp3(sesion: Sesion, tmp: str = "/tmp") -> str | None:
+    nombre   = f"{sesion.fuente}_{sesion.id}"
+    ruta_mp3 = f"{tmp}/{nombre}.mp3"
+
+    if sesion.fuente == "senado":
+        plantilla = f"{tmp}/{nombre}.%(ext)s"
+        cmd = [
+            "yt-dlp",
+            "--extract-audio",
+            "--audio-format",  "mp3",
+            "--audio-quality", MP3_BITRATE,
+            "--output",        plantilla,
+            "--no-playlist",
+            "--quiet",
+            "--no-warnings",
+            sesion.url_video,
+        ]
+        log.info(f"Descargando (yt-dlp): {sesion.url_video[:80]}")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+        if res.returncode == 0 and os.path.exists(ruta_mp3):
+            tam_mb = os.path.getsize(ruta_mp3) / 1_048_576
+            log.info(f"MP3 listo: {ruta_mp3} ({tam_mb:.1f} MB)")
+            return ruta_mp3
+
+        log.error(f"yt-dlp falló: {res.stderr[:300]}")
+        return None
+
+    else:
+        if not _tiene_rtmpdump():
+            log.error("rtmpdump no está instalado")
+            return None
+        ok = _descargar_rtmp_a_mp3(sesion.url_video, ruta_mp3)
+        return ruta_mp3 if ok else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SPEECH-TO-TEXT
 # ══════════════════════════════════════════════════════════════════════════════
 def transcribir(sesion: Sesion) -> str | None:
     try:
-        cliente  = speech.SpeechClient()
-        config   = speech.RecognitionConfig(
+        cliente = speech.SpeechClient()
+        config  = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.MP3,
             sample_rate_hertz=44100,
             language_code="es-CL",
