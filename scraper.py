@@ -26,7 +26,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from google.cloud import firestore, speech, storage
+from google.cloud import firestore, pubsub_v1, speech, storage
 
 # ── Configuración ──────────────────────────────────────────────────────────────
 GCP_PROJECT         = "crack-map-317501"
@@ -421,6 +421,35 @@ def ya_procesada(db: firestore.Client, sesion: Sesion) -> bool:
                           "error_transcripcion", "error_guardado_txt")
 
 
+def _notificar(sesion: Sesion, estado: str):
+    """Publica en Pub/Sub cuando hay eventos importantes."""
+    topic = None
+    if estado == "detectada":
+        topic = f"projects/{GCP_PROJECT}/topics/sesion-detectada"
+    elif estado == "listo":
+        topic = f"projects/{GCP_PROJECT}/topics/transcripcion-lista"
+
+    if not topic:
+        return
+
+    try:
+        import json
+        publisher = pubsub_v1.PublisherClient()
+        mensaje = {
+            "titulo":  sesion.titulo,
+            "fuente":  sesion.fuente.upper(),
+            "fecha":   sesion.fecha_str,
+            "uri_txt": sesion.uri_txt,
+            "uri_mp3": sesion.uri_audio,
+        }
+        datos  = json.dumps(mensaje).encode("utf-8")
+        futuro = publisher.publish(topic, datos)
+        msg_id = futuro.result(timeout=10)
+        log.info(f"[Pub/Sub] Publicado en {topic.split('/')[-1]} — id: {msg_id}")
+    except Exception as e:
+        log.error(f"[Pub/Sub] ERROR: {e}")
+
+
 def actualizar_estado(db: firestore.Client, sesion: Sesion,
                       estado: str, extra: dict = None):
     datos = {
@@ -438,6 +467,11 @@ def actualizar_estado(db: firestore.Client, sesion: Sesion,
     db.collection(FIRESTORE_COLECCION).document(sesion.id).set(datos, merge=True)
     log.info(f"[Firestore] {sesion.id} → {estado}  ({sesion.titulo[:50]})")
 
+    # Notificar en estados importantes
+    _notificar(sesion, estado)
+git add scraper.py
+git commit -m "Agregar llamada a _notificar en actualizar_estado"
+git push origin main
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLOUD STORAGE
