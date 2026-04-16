@@ -498,52 +498,74 @@ def transcribir(sesion: Sesion) -> str | None:
 # ══════════════════════════════════════════════════════════════════════════════
 # FLUJO PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_WORKERS = 3  # sesiones procesadas en paralelo
+
+def procesar_sesion(sesion: Sesion, db: firestore.Client):
+    """Procesa una sesión completa de punta a punta."""
+    log.info(f"\n{'─'*60}")
+    log.info(f"NUEVA  : {sesion.titulo}")
+    log.info(f"Fuente : {sesion.fuente.upper()}  |  Fecha: {sesion.fecha_str}")
+    log.info(f"Video  : {sesion.url_video[:80]}")
+
+    actualizar_estado(db, sesion, "detectada")
+
+    actualizar_estado(db, sesion, "descargando")
+    ruta_mp3 = descargar_mp3(sesion)
+    if not ruta_mp3:
+        actualizar_estado(db, sesion, "error_descarga")
+        return
+
+    ok = subir_audio(ruta_mp3, sesion)
+    os.remove(ruta_mp3)
+    if not ok:
+        actualizar_estado(db, sesion, "error_subida_audio")
+        return
+    actualizar_estado(db, sesion, "audio_listo")
+
+    actualizar_estado(db, sesion, "transcribiendo")
+    texto = transcribir(sesion)
+    if not texto:
+        actualizar_estado(db, sesion, "error_transcripcion")
+        return
+
+    ok = subir_txt(texto, sesion)
+    actualizar_estado(db, sesion,
+                      "listo" if ok else "error_guardado_txt",
+                      extra={"caracteres": len(texto)})
+
+
 def main():
     db = firestore.Client(project=GCP_PROJECT)
 
     todas  = scrape_senado(max_paginas=5) + scrape_camara()
     log.info(f"\nTotal sesiones detectadas: {len(todas)}")
 
-    nuevas = 0
-    for sesion in todas:
-        if ya_procesada(db, sesion):
-            log.debug(f"Saltando: {sesion.titulo}")
-            continue
+    # Filtrar solo las que necesitan procesamiento
+    pendientes = [s for s in todas if not ya_procesada(db, s)]
+    log.info(f"Sesiones pendientes: {len(pendientes)}")
 
-        nuevas += 1
-        log.info(f"\n{'─'*60}")
-        log.info(f"NUEVA  : {sesion.titulo}")
-        log.info(f"Fuente : {sesion.fuente.upper()}  |  Fecha: {sesion.fecha_str}")
-        log.info(f"Video  : {sesion.url_video[:80]}")
+    if not pendientes:
+        log.info("No hay sesiones nuevas. Ciclo completado.")
+        return
 
-        actualizar_estado(db, sesion, "detectada")
-
-        actualizar_estado(db, sesion, "descargando")
-        ruta_mp3 = descargar_mp3(sesion)
-        if not ruta_mp3:
-            actualizar_estado(db, sesion, "error_descarga")
-            continue
-
-        ok = subir_audio(ruta_mp3, sesion)
-        os.remove(ruta_mp3)
-        if not ok:
-            actualizar_estado(db, sesion, "error_subida_audio")
-            continue
-        actualizar_estado(db, sesion, "audio_listo")
-
-        actualizar_estado(db, sesion, "transcribiendo")
-        texto = transcribir(sesion)
-        if not texto:
-            actualizar_estado(db, sesion, "error_transcripcion")
-            continue
-
-        ok = subir_txt(texto, sesion)
-        actualizar_estado(db, sesion,
-                          "listo" if ok else "error_guardado_txt",
-                          extra={"caracteres": len(texto)})
+    # Procesar en paralelo con MAX_WORKERS threads
+    log.info(f"Procesando con {MAX_WORKERS} workers en paralelo...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futuros = {
+            executor.submit(procesar_sesion, sesion, db): sesion
+            for sesion in pendientes
+        }
+        for futuro in as_completed(futuros):
+            sesion = futuros[futuro]
+            try:
+                futuro.result()
+            except Exception as e:
+                log.error(f"Error procesando {sesion.titulo}: {e}")
 
     log.info(f"\n{'='*60}")
-    log.info(f"Ciclo completado — sesiones nuevas: {nuevas}")
+    log.info(f"Ciclo completado — sesiones procesadas: {len(pendientes)}")
 
 
 if __name__ == "__main__":
