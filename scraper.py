@@ -6,12 +6,14 @@ Senado : articles con clase 'col span_1_of_4 article'
          luego entra a la página individual y extrae el .mp4 de janux
 
 Cámara : página television.aspx con URLs rtmp en atributos HTML escapados (&#39;)
-         descarga con rtmpdump (protocolo rtmp nativo)
+         descarga con rtmpdump + flag --live (protocolo rtmp nativo)
          convierte a MP3 con ffmpeg directamente
 
 Bucket destino: gs://komv1/
-  audio/          → MP3
-  transcripciones/→ TXT
+  audio/          → MP3  (nombre legible)
+  transcripciones/→ TXT  (nombre legible)
+
+Procesamiento: 3 sesiones en paralelo con ThreadPoolExecutor
 """
 
 import hashlib
@@ -21,6 +23,7 @@ import logging
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urljoin
@@ -36,6 +39,7 @@ FIRESTORE_COLECCION = "sesiones"
 MP3_BITRATE         = "128k"
 CARPETA_AUDIO       = "audio"
 CARPETA_TX          = "transcripciones"
+MAX_WORKERS         = 3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,12 +71,19 @@ class Sesion:
             self.fecha_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     @property
+    def nombre_limpio(self) -> str:
+        """Convierte el título en nombre de archivo seguro."""
+        nombre = re.sub(r'[^\w\s-]', '', self.titulo)
+        nombre = re.sub(r'\s+', '_', nombre.strip())
+        return f"{nombre[:80]}_{self.fecha_str}"
+
+    @property
     def ruta_audio(self):
-        return f"{CARPETA_AUDIO}/{self.fuente}/{self.fecha_str}/{self.id}.mp3"
+        return f"{CARPETA_AUDIO}/{self.fuente}/{self.fecha_str}/{self.nombre_limpio}.mp3"
 
     @property
     def ruta_txt(self):
-        return f"{CARPETA_TX}/{self.fuente}/{self.fecha_str}/{self.id}.txt"
+        return f"{CARPETA_TX}/{self.fuente}/{self.fecha_str}/{self.nombre_limpio}.txt"
 
     @property
     def uri_audio(self):
@@ -387,17 +398,26 @@ def _tiene_rtmpdump() -> bool:
 def _descargar_rtmp_a_mp3(url_rtmp: str, ruta_mp3: str) -> bool:
     log.info(f"Descargando RTMP → MP3: {url_rtmp[:70]}")
 
-    rtmpdump_cmd = ["rtmpdump", "-r", url_rtmp, "-o", "-", "--quiet"]
-    ffmpeg_cmd   = [
+    rtmpdump_cmd = [
+        "rtmpdump",
+        "-r", url_rtmp,
+        "-o", "-",
+        "--live",
+        "--timeout", "120",
+        "--quiet",
+    ]
+    ffmpeg_cmd = [
         "ffmpeg", "-i", "pipe:0", "-vn",
         "-acodec", "libmp3lame", "-ab", MP3_BITRATE,
         "-f", "mp3", "-y", ruta_mp3,
     ]
 
     try:
-        proc_rtmp   = subprocess.Popen(rtmpdump_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc_rtmp   = subprocess.Popen(rtmpdump_cmd, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL)
         proc_ffmpeg = subprocess.Popen(ffmpeg_cmd, stdin=proc_rtmp.stdout,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
         proc_rtmp.stdout.close()
         proc_ffmpeg.wait(timeout=3600)
         proc_rtmp.wait(timeout=10)
@@ -496,18 +516,15 @@ def transcribir(sesion: Sesion) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FLUJO PRINCIPAL
+# PROCESAMIENTO POR SESIÓN
 # ══════════════════════════════════════════════════════════════════════════════
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-MAX_WORKERS = 3  # sesiones procesadas en paralelo
-
 def procesar_sesion(sesion: Sesion, db: firestore.Client):
     """Procesa una sesión completa de punta a punta."""
     log.info(f"\n{'─'*60}")
     log.info(f"NUEVA  : {sesion.titulo}")
     log.info(f"Fuente : {sesion.fuente.upper()}  |  Fecha: {sesion.fecha_str}")
     log.info(f"Video  : {sesion.url_video[:80]}")
+    log.info(f"Archivo: {sesion.nombre_limpio}")
 
     actualizar_estado(db, sesion, "detectada")
 
@@ -536,13 +553,15 @@ def procesar_sesion(sesion: Sesion, db: firestore.Client):
                       extra={"caracteres": len(texto)})
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FLUJO PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
     db = firestore.Client(project=GCP_PROJECT)
 
     todas  = scrape_senado(max_paginas=5) + scrape_camara()
     log.info(f"\nTotal sesiones detectadas: {len(todas)}")
 
-    # Filtrar solo las que necesitan procesamiento
     pendientes = [s for s in todas if not ya_procesada(db, s)]
     log.info(f"Sesiones pendientes: {len(pendientes)}")
 
@@ -550,8 +569,8 @@ def main():
         log.info("No hay sesiones nuevas. Ciclo completado.")
         return
 
-    # Procesar en paralelo con MAX_WORKERS threads
-    log.info(f"Procesando con {MAX_WORKERS} workers en paralelo...")
+    log.info(f"Procesando {len(pendientes)} sesiones con {MAX_WORKERS} workers en paralelo...")
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futuros = {
             executor.submit(procesar_sesion, sesion, db): sesion
