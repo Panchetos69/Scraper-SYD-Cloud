@@ -317,9 +317,15 @@ def ya_procesada(db: firestore.Client, sesion: Sesion) -> bool:
     if not doc.exists:
         return False
     estado = doc.to_dict().get("estado", "")
-    return estado not in ("error_descarga", "error_subida_audio",
-                          "error_transcripcion", "error_guardado_txt")
-
+    # Reintentar si falló o quedó colgado
+    return estado not in (
+        "error_descarga",
+        "error_subida_audio",
+        "error_transcripcion",
+        "error_guardado_txt",
+        "descargando",       # quedó colgado
+        "transcribiendo",    # quedó colgado
+    )
 
 def actualizar_estado(db: firestore.Client, sesion: Sesion,
                       estado: str, extra: dict = None):
