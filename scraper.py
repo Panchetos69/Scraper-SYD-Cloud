@@ -480,11 +480,13 @@ def descargar_mp3(sesion: Sesion, tmp: str = "/tmp") -> str | None:
 def transcribir(sesion: Sesion) -> str | None:
     try:
         cliente = speech.SpeechClient()
-        config  = speech.RecognitionConfig(
+        config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.MP3,
-            sample_rate_hertz=44100,
+            sample_rate_hertz=48000,      # frecuencia real de los audios
+            audio_channel_count=2,        # stereo
             language_code="es-CL",
             enable_automatic_punctuation=True,
+            enable_separate_recognition_per_channel=False,
             diarization_config=speech.SpeakerDiarizationConfig(
                 enable_speaker_diarization=True,
                 min_speaker_count=2,
@@ -498,6 +500,7 @@ def transcribir(sesion: Sesion) -> str | None:
                 "interpelación", "acusación constitucional",
             ])],
         )
+
         audio = speech.RecognitionAudio(uri=sesion.uri_audio)
         log.info(f"Iniciando Speech-to-Text: {sesion.uri_audio}")
         op    = cliente.long_running_recognize(config=config, audio=audio)
