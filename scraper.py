@@ -568,14 +568,26 @@ def procesar_sesion(sesion: Sesion, db: firestore.Client):
 def main():
     db = firestore.Client(project=GCP_PROJECT)
 
+    # Solo correr lunes, martes y miércoles
+    hoy = datetime.now()
+    if hoy.weekday() > 2:  # 0=lunes, 1=martes, 2=miércoles
+        log.info(f"Hoy es {DIAS_ES.get(hoy.strftime('%A'), '')} — scraper de transcripciones no activo.")
+        return
+
+    fecha_hoy = hoy.strftime("%Y-%m-%d")
+    log.info(f"Buscando sesiones del día: {fecha_hoy}")
+
     todas  = scrape_senado(max_paginas=5) + scrape_camara()
-    log.info(f"\nTotal sesiones detectadas: {len(todas)}")
+    
+    # Filtrar SOLO sesiones de hoy
+    todas = [s for s in todas if s.fecha_str == fecha_hoy]
+    log.info(f"Sesiones de hoy ({fecha_hoy}): {len(todas)}")
 
     pendientes = [s for s in todas if not ya_procesada(db, s)]
     log.info(f"Sesiones pendientes: {len(pendientes)}")
 
     if not pendientes:
-        log.info("No hay sesiones nuevas. Ciclo completado.")
+        log.info("No hay sesiones nuevas hoy. Ciclo completado.")
         return
 
     log.info(f"Procesando {len(pendientes)} sesiones con {MAX_WORKERS} workers en paralelo...")
