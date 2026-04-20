@@ -41,6 +41,30 @@ CARPETA_AUDIO       = "audio"
 CARPETA_TX          = "transcripciones"
 MAX_WORKERS         = 3
 
+TG_TOKEN   = os.environ.get("TG_TOKEN", "8526676401:AAESmMiVjf7fKUi9bzcq0mMz2CJ0nzIIxxY")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "6396081535")
+
+def _tg_texto(msg: str):
+    """Envía mensaje a todos los usuarios activos del bot."""
+    try:
+        db = firestore.Client(project=GCP_PROJECT)
+        usuarios = db.collection("bot_usuarios").where("activo", "==", True).stream()
+        chat_ids = [d.to_dict().get("chat_id") for d in usuarios]
+        
+        # Si no hay usuarios registrados en Firestore, enviamos al chat default
+        if not chat_ids:
+            chat_ids = [TG_CHAT_ID]
+
+        for chat_id in chat_ids:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=10
+            )
+        log.info(f"[Telegram] Mensaje enviado a {len(chat_ids)} usuarios")
+    except Exception as e:
+        log.error(f"Error en Telegram Broadcast: {e}")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -281,14 +305,36 @@ def scrape_camara() -> list[Sesion]:
 # ══════════════════════════════════════════════════════════════════════════════
 # PUB/SUB — NOTIFICACIONES
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PUB/SUB Y TELEGRAM — NOTIFICACIONES
+# ══════════════════════════════════════════════════════════════════════════════
 def _notificar(sesion: Sesion, estado: str):
-    """Publica en Pub/Sub cuando hay eventos importantes."""
+    """Publica en Pub/Sub y notifica por Telegram cuando hay eventos importantes."""
     topic = None
+    
+    # 1. Enviar notificación por Telegram
     if estado == "detectada":
         topic = f"projects/{GCP_PROJECT}/topics/sesion-detectada"
+        msg = (
+            f"🎥 <b>Nueva Sesión Detectada</b>\n"
+            f"🏛 {sesion.fuente.upper()}\n"
+            f"📌 {sesion.titulo}\n"
+            f"📅 {sesion.fecha_str}"
+        )
+        _tg_texto(msg)
+        
     elif estado == "listo":
         topic = f"projects/{GCP_PROJECT}/topics/transcripcion-lista"
+        msg = (
+            f"✅ <b>Transcripción Lista</b>\n"
+            f"🏛 {sesion.fuente.upper()}\n"
+            f"📌 {sesion.titulo}\n"
+            f"🔗 <a href='{sesion.url_video}'>Ver Video Original</a>\n"
+            f"📄 TXT en GCS: <code>{sesion.uri_txt}</code>"
+        )
+        _tg_texto(msg)
 
+    # 2. Publicar en Pub/Sub
     if not topic:
         return
 
